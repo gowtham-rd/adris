@@ -16,4 +16,3 @@ logs/tegrastats.log
 
 # Model binaries (too large for git)
 model/*.engine
-model/*.onnx
