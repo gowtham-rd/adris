@@ -79,9 +79,14 @@ bindings = [int(d_input), int(d_output)]
 def preprocess_image(path):
     image = Image.open(path).convert("RGB")
     image = image.resize((640, 640))
+
     img = np.array(image, dtype=np.float32) / 255.0
     img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-    img = np.expand_dims(img, axis=0)   # add batch dim
+    img = np.expand_dims(img, axis=0)
+
+    # IMPORTANT: Make contiguous for CUDA
+    img = np.ascontiguousarray(img)
+
     return img
 
 
@@ -136,7 +141,6 @@ def main():
             cuda.memcpy_htod(d_input, img)
             start = time.time()
             context.execute_v2(bindings)
-            cuda.memcpy_dtoh(np.zeros(output_size, dtype=np.float32), d_output)
             latency = (time.time() - start) * 1000
 
             output_host = np.empty(output_size, dtype=np.float32)
