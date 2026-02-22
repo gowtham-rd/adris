@@ -2,18 +2,23 @@
 # main_app.py
 
 import json
-import time
 import os
+import time
+import sys
 from pathlib import Path
 from datetime import datetime
 
 import numpy as np
 from PIL import Image
-import psutil
 
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
+
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 
 # ------------------------------------------------------------
@@ -26,13 +31,12 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "board_config.json"
 with open(CONFIG_PATH, "r") as f:
     CONFIG = json.load(f)
 
-ENGINE_PATH = PROJECT_ROOT / "model" / "best.engine"
-FRAME_PATH = "/dev/shm/adris_latest.jpg"
-
 TARGET_FPS = CONFIG["runtime"]["target_fps"]
-CONF_THRESHOLD = 0.4
-
+SHARED_FRAME_PATH = CONFIG["paths"]["shared_frame"]
 SHARED_JSON_PATH = CONFIG["paths"]["shared_json"]
+ENGINE_PATH = CONFIG["mode"]["engine_path"]
+
+CONF_THRESHOLD = CONFIG.get("detection", {}).get("conf_threshold", 0.3)
 
 
 # ------------------------------------------------------------
@@ -40,77 +44,105 @@ SHARED_JSON_PATH = CONFIG["paths"]["shared_json"]
 # ------------------------------------------------------------
 
 def write_json_atomic(data, path):
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
-    os.replace(tmp_path, path)
+    os.replace(tmp, path)
 
 
 # ------------------------------------------------------------
-# TensorRT Setup
+# TensorRT Engine Wrapper
 # ------------------------------------------------------------
 
-TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+class TRTInference:
+    def __init__(self, engine_path):
+        self.logger = trt.Logger(trt.Logger.INFO)
+        self.runtime = trt.Runtime(self.logger)
 
-with open(str(ENGINE_PATH), "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
-    engine = runtime.deserialize_cuda_engine(f.read())
+        with open(engine_path, "rb") as f:
+            engine_data = f.read()
 
-context = engine.create_execution_context()
+        self.engine = self.runtime.deserialize_cuda_engine(engine_data)
+        self.context = self.engine.create_execution_context()
 
-input_index = engine.get_binding_index("images")
-output_index = engine.get_binding_index("output0")
+        self.input_index = 0
+        self.output_index = 1
 
-input_shape = engine.get_binding_shape(input_index)
-output_shape = engine.get_binding_shape(output_index)
+        self.input_shape = tuple(self.engine.get_binding_shape(self.input_index))
+        self.output_shape = tuple(self.engine.get_binding_shape(self.output_index))
 
-input_size = trt.volume(input_shape)
-output_size = trt.volume(output_shape)
+        self.d_input = cuda.mem_alloc(np.prod(self.input_shape) * 4)
+        self.d_output = cuda.mem_alloc(np.prod(self.output_shape) * 4)
 
-d_input = cuda.mem_alloc(input_size * np.float32().nbytes)
-d_output = cuda.mem_alloc(output_size * np.float32().nbytes)
+        self.output_host = np.empty(self.output_shape, dtype=np.float32)
 
-bindings = [int(d_input), int(d_output)]
+        self.bindings = [None] * self.engine.num_bindings
+        self.bindings[self.input_index] = int(self.d_input)
+        self.bindings[self.output_index] = int(self.d_output)
+
+        self.stream = cuda.Stream()
+
+        print("Engine Loaded")
+        print("Input shape:", self.input_shape)
+        print("Output shape:", self.output_shape)
+
+    def infer(self, inp):
+        inp = np.ascontiguousarray(inp, dtype=np.float32)
+
+        cuda.memcpy_htod_async(self.d_input, inp, self.stream)
+
+        self.context.execute_async_v2(
+            bindings=self.bindings,
+            stream_handle=self.stream.handle
+        )
+
+        cuda.memcpy_dtoh_async(self.output_host, self.d_output, self.stream)
+        self.stream.synchronize()
+
+        return self.output_host
 
 
 # ------------------------------------------------------------
-# Preprocess
+# Image preprocessing
 # ------------------------------------------------------------
 
 def preprocess_image(path):
-    image = Image.open(path).convert("RGB")
-    image = image.resize((640, 640))
+    img = Image.open(path).convert("RGB")
+    img = img.resize((640, 640))
 
-    img = np.array(image, dtype=np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))  # HWC -> CHW
-    img = np.expand_dims(img, axis=0)
+    arr = np.array(img).astype(np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    arr = np.expand_dims(arr, axis=0)
 
-    # IMPORTANT: Make contiguous for CUDA
-    img = np.ascontiguousarray(img)
-
-    return img
+    return np.ascontiguousarray(arr, dtype=np.float32)
 
 
 # ------------------------------------------------------------
-# YOLO Decode
+# Detection decoding (basic confidence filter only)
 # ------------------------------------------------------------
 
 def decode_output(output):
     detections = []
 
-    output = output.reshape(25200, 6)
+    output = output[0]  # (25200, 6)
 
     for row in output:
-        x, y, w, h, conf, cls = row
+        conf = float(row[4])
         if conf < CONF_THRESHOLD:
             continue
 
+        x, y, w, h = row[0:4]
+        class_id = int(row[5])
+
         detections.append({
-            "x": float(x),
-            "y": float(y),
-            "w": float(w),
-            "h": float(h),
-            "confidence": float(conf),
-            "class_id": int(cls)
+            "class_id": class_id,
+            "confidence": conf,
+            "bbox_xywh": [
+                float(x),
+                float(y),
+                float(w),
+                float(h)
+            ]
         })
 
     return detections
@@ -121,48 +153,57 @@ def decode_output(output):
 # ------------------------------------------------------------
 
 def main():
-    print("ADRIS TensorRT Inference Started")
-    print(f"Engine: {ENGINE_PATH}")
-    print(f"Input shape: {input_shape}")
-    print(f"Output shape: {output_shape}\n")
+    print("ADRIS Inference Started")
+
+    trt_engine = TRTInference(ENGINE_PATH)
 
     frame_interval = 1.0 / TARGET_FPS
 
     while True:
         loop_start = time.time()
 
-        if not os.path.exists(FRAME_PATH):
-            time.sleep(0.1)
-            continue
+        timestamp = datetime.now().astimezone().isoformat()
 
         try:
-            img = preprocess_image(FRAME_PATH)
+            # 1. Load image
+            inp = preprocess_image(SHARED_FRAME_PATH)
 
-            cuda.memcpy_htod(d_input, img)
-            start = time.time()
-            context.execute_v2(bindings)
-            latency = (time.time() - start) * 1000
+            # 2. Inference
+            t0 = time.time()
+            output = trt_engine.infer(inp)
+            t1 = time.time()
 
-            output_host = np.empty(output_size, dtype=np.float32)
-            cuda.memcpy_dtoh(output_host, d_output)
+            latency_ms = (t1 - t0) * 1000.0
 
-            detections = decode_output(output_host)
+            # 3. Decode
+            detections = decode_output(output)
+
+            # 4. System stats
+            cpu = psutil.cpu_percent() if psutil else "N/A"
+            mem = psutil.virtual_memory().percent if psutil else "N/A"
 
             payload = {
-                "timestamp": datetime.now().astimezone().isoformat(),
+                "timestamp": timestamp,
                 "detections": detections,
-                "latency_ms": latency,
-                "fps": 1000.0 / latency if latency > 0 else 0,
+                "latency_ms": latency_ms,
+                "fps": 1.0 / (time.time() - loop_start),
                 "system": {
-                    "cpu_percent": psutil.cpu_percent(),
-                    "memory_percent": psutil.virtual_memory().percent
+                    "cpu_percent": cpu,
+                    "memory_percent": mem
                 }
             }
 
-            write_json_atomic(payload, SHARED_JSON_PATH)
-
         except Exception as e:
-            print("Inference error:", e)
+            payload = {
+                "timestamp": timestamp,
+                "detections": [],
+                "latency_ms": "N/A",
+                "fps": "N/A",
+                "system": {},
+                "error": str(e)
+            }
+
+        write_json_atomic(payload, SHARED_JSON_PATH)
 
         elapsed = time.time() - loop_start
         sleep_time = max(0, frame_interval - elapsed)
