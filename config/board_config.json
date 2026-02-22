@@ -1,0 +1,29 @@
+{
+  "board": {
+    "name": "ADRIS-JETSON-NANO",
+    "location": "LAB",
+    "version": "1.0"
+  },
+
+  "network": {
+    "host": "0.0.0.0",
+    "port": 5050
+  },
+
+  "runtime": {
+    "target_fps": 15,
+    "frame_width": 640,
+    "frame_height": 640
+  },
+
+  "paths": {
+    "shared_frame": "/dev/shm/adris_latest.jpg",
+    "shared_json": "/dev/shm/adris_latest.json",
+    "csv_log": "logs/predictions_log.csv"
+  },
+
+  "model": {
+    "onnx_path": "model/best.onnx",
+    "engine_path": "model/best.engine"
+  }
+}
