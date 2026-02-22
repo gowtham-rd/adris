@@ -4,7 +4,7 @@
 import json
 import os
 import time
-import sys
+import signal
 from pathlib import Path
 from datetime import datetime
 
@@ -31,16 +31,33 @@ CONFIG_PATH = PROJECT_ROOT / "config" / "board_config.json"
 with open(CONFIG_PATH, "r") as f:
     CONFIG = json.load(f)
 
-TARGET_FPS = CONFIG["runtime"]["target_fps"]
+TARGET_FPS = float(CONFIG["runtime"]["target_fps"])
 SHARED_FRAME_PATH = CONFIG["paths"]["shared_frame"]
 SHARED_JSON_PATH = CONFIG["paths"]["shared_json"]
 ENGINE_PATH = CONFIG["mode"]["engine_path"]
 
-CONF_THRESHOLD = CONFIG.get("detection", {}).get("conf_threshold", 0.3)
+CONF_THRESHOLD = float(CONFIG.get("detection", {}).get("conf_threshold", 0.3))
+
+MODEL_W = 640
+MODEL_H = 640
 
 
 # ------------------------------------------------------------
-# Atomic JSON write
+# Graceful Shutdown
+# ------------------------------------------------------------
+
+_STOP = False
+
+def _stop_handler(signum, frame):
+    global _STOP
+    _STOP = True
+
+signal.signal(signal.SIGINT, _stop_handler)
+signal.signal(signal.SIGTERM, _stop_handler)
+
+
+# ------------------------------------------------------------
+# Atomic JSON Write
 # ------------------------------------------------------------
 
 def write_json_atomic(data, path):
@@ -51,11 +68,16 @@ def write_json_atomic(data, path):
 
 
 # ------------------------------------------------------------
-# TensorRT Engine Wrapper
+# TensorRT Engine
 # ------------------------------------------------------------
 
 class TRTInference:
+
     def __init__(self, engine_path):
+
+        if not os.path.exists(engine_path):
+            raise FileNotFoundError(f"Engine not found: {engine_path}")
+
         self.logger = trt.Logger(trt.Logger.INFO)
         self.runtime = trt.Runtime(self.logger)
 
@@ -63,6 +85,9 @@ class TRTInference:
             engine_data = f.read()
 
         self.engine = self.runtime.deserialize_cuda_engine(engine_data)
+        if self.engine is None:
+            raise RuntimeError("Failed to deserialize engine")
+
         self.context = self.engine.create_execution_context()
 
         self.input_index = 0
@@ -71,12 +96,23 @@ class TRTInference:
         self.input_shape = tuple(self.engine.get_binding_shape(self.input_index))
         self.output_shape = tuple(self.engine.get_binding_shape(self.output_index))
 
-        self.d_input = cuda.mem_alloc(np.prod(self.input_shape) * 4)
-        self.d_output = cuda.mem_alloc(np.prod(self.output_shape) * 4)
+        self.input_dtype = trt.nptype(self.engine.get_binding_dtype(self.input_index))
+        self.output_dtype = trt.nptype(self.engine.get_binding_dtype(self.output_index))
 
-        self.output_host = np.empty(self.output_shape, dtype=np.float32)
+        self.d_input = cuda.mem_alloc(
+            int(np.prod(self.input_shape)) * np.dtype(self.input_dtype).itemsize
+        )
 
-        self.bindings = [None] * self.engine.num_bindings
+        self.d_output = cuda.mem_alloc(
+            int(np.prod(self.output_shape)) * np.dtype(self.output_dtype).itemsize
+        )
+
+        self.output_host = cuda.pagelocked_empty(
+            self.output_shape,
+            dtype=self.output_dtype
+        )
+
+        self.bindings = [0] * self.engine.num_bindings
         self.bindings[self.input_index] = int(self.d_input)
         self.bindings[self.output_index] = int(self.d_output)
 
@@ -86,15 +122,23 @@ class TRTInference:
         print("Input shape:", self.input_shape)
         print("Output shape:", self.output_shape)
 
+
     def infer(self, inp):
-        inp = np.ascontiguousarray(inp, dtype=np.float32)
+
+        inp = np.ascontiguousarray(inp, dtype=self.input_dtype)
+
+        if tuple(inp.shape) != self.input_shape:
+            raise ValueError(f"Input shape mismatch: {inp.shape} vs {self.input_shape}")
 
         cuda.memcpy_htod_async(self.d_input, inp, self.stream)
 
-        self.context.execute_async_v2(
+        ok = self.context.execute_async_v2(
             bindings=self.bindings,
             stream_handle=self.stream.handle
         )
+
+        if not ok:
+            raise RuntimeError("TensorRT execution failed")
 
         cuda.memcpy_dtoh_async(self.output_host, self.d_output, self.stream)
         self.stream.synchronize()
@@ -103,14 +147,18 @@ class TRTInference:
 
 
 # ------------------------------------------------------------
-# Image preprocessing
+# Image Preprocessing
 # ------------------------------------------------------------
 
 def preprocess_image(path):
-    img = Image.open(path).convert("RGB")
-    img = img.resize((640, 640))
 
-    arr = np.array(img).astype(np.float32) / 255.0
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Frame not found: {path}")
+
+    img = Image.open(path).convert("RGB")
+    img = img.resize((MODEL_W, MODEL_H))
+
+    arr = np.array(img, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))
     arr = np.expand_dims(arr, axis=0)
 
@@ -118,16 +166,18 @@ def preprocess_image(path):
 
 
 # ------------------------------------------------------------
-# Detection decoding (basic confidence filter only)
+# Detection Decode (Basic Confidence Filter)
 # ------------------------------------------------------------
 
 def decode_output(output):
+
     detections = []
 
-    output = output[0]  # (25200, 6)
+    out = output[0]  # (25200, 6)
 
-    for row in output:
+    for row in out:
         conf = float(row[4])
+
         if conf < CONF_THRESHOLD:
             continue
 
@@ -153,40 +203,39 @@ def decode_output(output):
 # ------------------------------------------------------------
 
 def main():
+
     print("ADRIS Inference Started")
+    print("Engine:", ENGINE_PATH)
+    print("Target FPS:", TARGET_FPS)
 
     trt_engine = TRTInference(ENGINE_PATH)
 
     frame_interval = 1.0 / TARGET_FPS
 
-    while True:
-        loop_start = time.time()
+    while not _STOP:
 
+        loop_start = time.time()
         timestamp = datetime.now().astimezone().isoformat()
 
         try:
-            # 1. Load image
+
             inp = preprocess_image(SHARED_FRAME_PATH)
 
-            # 2. Inference
             t0 = time.time()
             output = trt_engine.infer(inp)
             t1 = time.time()
 
             latency_ms = (t1 - t0) * 1000.0
-
-            # 3. Decode
             detections = decode_output(output)
 
-            # 4. System stats
             cpu = psutil.cpu_percent() if psutil else "N/A"
             mem = psutil.virtual_memory().percent if psutil else "N/A"
 
             payload = {
                 "timestamp": timestamp,
                 "detections": detections,
-                "latency_ms": latency_ms,
-                "fps": 1.0 / (time.time() - loop_start),
+                "latency_ms": float(latency_ms),
+                "fps": float(1.0 / max(time.time() - loop_start, 1e-9)),
                 "system": {
                     "cpu_percent": cpu,
                     "memory_percent": mem
@@ -194,6 +243,7 @@ def main():
             }
 
         except Exception as e:
+
             payload = {
                 "timestamp": timestamp,
                 "detections": [],
@@ -208,6 +258,8 @@ def main():
         elapsed = time.time() - loop_start
         sleep_time = max(0, frame_interval - elapsed)
         time.sleep(sleep_time)
+
+    print("ADRIS stopped cleanly.")
 
 
 if __name__ == "__main__":
