@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # camera_writer.sh
 #
-# ADRIS Camera Writer (Robust Version)
-#
-# Fixes vs earlier version:
-# - GStreamer writes numbered frames: /dev/shm/adris_cam_%05d.jpg
-# - A tiny loop publishes the newest frame atomically to /dev/shm/adris_latest.jpg
-#   (prevents partial reads and guarantees continuous updates)
-#
-# Output contract (LOCKED):
-# - /dev/shm/adris_latest.jpg is always a valid 640x640 JPEG and updates continuously
+# ADRIS Camera Writer (Jetson-safe)
+# - Captures CSI frames via nvarguscamerasrc
+# - Center-crops 1280x720 -> 720x720
+# - Resizes to 640x640
+# - Writes numbered JPEGs to /dev/shm/adris_cam_%05d.jpg
+# - Publishes newest atomically to /dev/shm/adris_latest.jpg
 
 set -euo pipefail
 
@@ -34,18 +31,14 @@ if [ ! -d "/dev/shm" ]; then
   exit 1
 fi
 
-# Clean old frames
-rm -f /dev/shm/adris_cam_*.jpg || true
+rm -f /dev/shm/adris_cam_*.jpg >/dev/null 2>&1 || true
+rm -f "${PUBLISH_PATH}" "${PUBLISH_TMP}" >/dev/null 2>&1 || true
 
-# Start GStreamer in background
-# Crop math:
-# 1280x720 -> center 720x720:
-# left=280 right=1000 top=0 bottom=720
 gst-launch-1.0 -e \
   nvarguscamerasrc ! \
-  video/x-raw(memory:NVMM),width=1280,height=720,framerate=${FPS}/1 ! \
+  "video/x-raw(memory:NVMM),width=1280,height=720,framerate=${FPS}/1" ! \
   nvvidconv top=0 bottom=720 left=280 right=1000 ! \
-  video/x-raw,width=640,height=640,format=I420 ! \
+  "video/x-raw,width=640,height=640,format=I420" ! \
   jpegenc ! \
   multifilesink location="${TMP_PATTERN}" max-files=3 sync=false \
   >/dev/null 2>&1 &
@@ -61,11 +54,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Publisher loop: always publish newest frame atomically
 while true; do
-  newest="$(ls -1t /dev/shm/adris_cam_*.jpg 2>/dev/null | head -n 1 || true)"
+  newest="$(ls -1t /dev/shm/adris_cam_*.jpg 2>/dev/null | head -n 1)"
   if [ -n "${newest}" ] && [ -f "${newest}" ]; then
-    # Atomic publish to fixed path
     cp -f "${newest}" "${PUBLISH_TMP}"
     mv -f "${PUBLISH_TMP}" "${PUBLISH_PATH}"
   fi
