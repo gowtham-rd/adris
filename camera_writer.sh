@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# camera_writer.sh
-#
-# ADRIS Camera Writer (Jetson-safe)
-# - Captures CSI frames via nvarguscamerasrc
-# - Center-crops 1280x720 -> 720x720
-# - Resizes to 640x640
-# - Writes numbered JPEGs to /dev/shm/adris_cam_%05d.jpg
-# - Publishes newest atomically to /dev/shm/adris_latest.jpg
-
 set -euo pipefail
 
 FPS="15"
